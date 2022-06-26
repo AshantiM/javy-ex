@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-if [[ "$(basename $(pwd))" != "javy" ]]; then
+if [[ "$(basename $(pwd))" != "javy-ex" ]]; then
     echo "Run this inside in the root of the javy repo" 1>&2
     exit 1
 fi
