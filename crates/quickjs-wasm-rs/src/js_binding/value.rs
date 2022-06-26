@@ -10,7 +10,7 @@ use quickjs_wasm_sys::{
 };
 use std::ffi::CString;
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum BigInt {
     Signed(i64),
     Unsigned(u64),
@@ -39,6 +39,12 @@ impl Value {
 
     pub(super) fn new_unchecked(context: *mut JSContext, value: JSValue) -> Self {
         Self { context, value }
+    }
+
+    pub fn is_promise(&self) -> bool {
+        self.get_property("then")
+            .and_then(|_| self.get_property("catch"))
+            .is_ok()
     }
 
     pub fn call(&self, receiver: &Self, args: &[Self]) -> Result<Self> {

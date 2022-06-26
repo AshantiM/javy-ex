@@ -3,10 +3,10 @@ use super::value::Value;
 use anyhow::Result;
 use quickjs_wasm_sys::{
     ext_js_exception, ext_js_null, ext_js_undefined, size_t as JS_size_t, JSCFunctionData,
-    JSContext, JSValue, JS_Eval, JS_FreeCString, JS_GetGlobalObject, JS_NewArray, JS_NewBigInt64,
-    JS_NewBool_Ext, JS_NewCFunctionData, JS_NewContext, JS_NewFloat64_Ext, JS_NewInt32_Ext,
-    JS_NewInt64_Ext, JS_NewObject, JS_NewRuntime, JS_NewStringLen, JS_NewUint32_Ext,
-    JS_ToCStringLen2, JS_EVAL_TYPE_GLOBAL,
+    JSContext, JSRuntime, JSValue, JS_Eval, JS_ExecutePendingJob, JS_FreeCString,
+    JS_GetGlobalObject, JS_NewArray, JS_NewBigInt64, JS_NewBool_Ext, JS_NewCFunctionData,
+    JS_NewContext, JS_NewFloat64_Ext, JS_NewInt32_Ext, JS_NewInt64_Ext, JS_NewObject,
+    JS_NewRuntime, JS_NewStringLen, JS_NewUint32_Ext, JS_ToCStringLen2, JS_EVAL_TYPE_GLOBAL,
 };
 use std::ffi::CString;
 use std::io::Write;
@@ -15,6 +15,7 @@ use std::os::raw::{c_char, c_int, c_void};
 #[derive(Debug)]
 pub struct Context {
     inner: *mut JSContext,
+    runtime: *mut JSRuntime,
 }
 
 impl Default for Context {
@@ -29,12 +30,35 @@ impl Default for Context {
             panic!("Couldn't create JavaScript context");
         }
 
-        Self { inner }
+        Self { inner, runtime }
     }
 }
 
 impl Context {
+    pub fn promise_source_code<'a>() -> &'a str {
+        r#"
+        var promiseExecuted;
+        var promiseResolved;
+        var resolvePromise =  function(promiseVal)
+        {
+            promiseVal
+            .then(ok => {
+                promiseExecuted = true;
+                promiseResolved = ok;
+            })
+            .catch(err => {
+                promiseExecuted = false;
+                promiseResolved = err;
+            })
+        }
+        "#
+    }
+
     pub fn eval_global(&self, name: &str, contents: &str) -> Result<Value> {
+        self.eval_global_internal(name, Self::promise_source_code())?;
+        self.eval_global_internal(name, contents)
+    }
+    fn eval_global_internal(&self, name: &str, contents: &str) -> Result<Value> {
         let input = CString::new(contents)?;
         let script_name = CString::new(name)?;
         let len = contents.len() - 1;
@@ -49,6 +73,34 @@ impl Context {
         };
 
         Value::new(self.inner, raw)
+    }
+
+    //should move this to value.rs
+    pub fn execute_promise(&mut self, promise_function: Value) -> Result<Value> {
+        let global_object = self.global_object()?;
+        let resolve_promise_function = global_object.get_property("resolvePromise")?;
+        resolve_promise_function.call(&global_object, &[promise_function])?;
+        loop {
+            let pointer = &mut self.inner;
+            let flag = unsafe { JS_ExecutePendingJob(self.runtime, pointer) };
+            if flag < 0 {
+                return Err(anyhow::anyhow!("Could not execute promise jobs"));
+            }
+
+            let promise_executed = global_object.get_property("promiseExecuted")?;
+            if let Ok(boolean_val) = promise_executed.as_bool() {
+                if boolean_val {
+                    let promise_value = global_object.get_property("promiseResolved")?;
+                    return Ok(promise_value);
+                } else {
+                    let promise_value = global_object.get_property("promiseResolved")?;
+                    return Err(anyhow::anyhow!(
+                        "Could not execute promise {:?}",
+                        promise_value
+                    ));
+                }
+            }
+        }
     }
 
     pub fn global_object(&self) -> Result<Value> {
@@ -377,6 +429,28 @@ mod tests {
 
         ctx.eval_global("main", "console.error(\"bonjour\", \"le\", \"monde\")")?;
         assert_eq!(b"bonjour le monde\n", stream.0.borrow().as_slice());
+        Ok(())
+    }
+
+    #[test]
+    fn test_promise() -> Result<()> {
+        let promise = r#"
+             async function add(left,right)
+             {
+                 return left + right
+             }
+        "#;
+
+        let mut ctx = Context::default();
+        ctx.eval_global("simplescript", promise)?;
+        let global = ctx.global_object()?;
+        let add_function = global.get_property("add")?;
+        let left = ctx.value_from_i32(2)?;
+        let right = ctx.value_from_i32(6)?;
+        let promise = add_function.call(&global, &[left, right])?;
+        assert!(promise.is_promise());
+        let result = ctx.execute_promise(promise)?;
+        assert_eq!(result.as_i32_unchecked(), 8);
         Ok(())
     }
 }
